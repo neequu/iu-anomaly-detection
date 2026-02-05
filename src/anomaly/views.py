@@ -11,6 +11,27 @@ import json
 
 router = APIRouter(tags=["Anomaly detection"])
 
+def compute_anomaly_score(
+    air_temperature: float,
+    process_temperature: float,
+    rotational_speed: float,
+    torque: float,
+) -> tuple[float, bool]:
+    features = np.array([[
+        air_temperature,
+        process_temperature,
+        rotational_speed,
+        torque,
+    ]])
+
+    features_scaled = scaler.transform(features)
+
+    raw_score = model.decision_function(features_scaled)[0]
+    anomaly_score = float(1.0 - (raw_score + 0.5))
+    is_anomaly = anomaly_score > 0.6
+
+    return round(anomaly_score, 4), is_anomaly
+
 @router.get(
     "/health",
     summary="Service health check",
@@ -18,45 +39,6 @@ router = APIRouter(tags=["Anomaly detection"])
 )
 def health_check() -> Dict[str, str]:
     return {"status": "ok"}
-
-
-@router.post(
-    "/predict",
-    response_model=AnomalyResponse,
-    summary="Predict anomaly score for a single sensor event",
-    description=(
-        "Receives one set of sensor measurements representing a produced item. "
-        "The data is preprocessed and passed to the anomaly detection model, "
-        "which returns an anomaly score and a boolean flag."
-    ),
-)
-def predict(input_data: SensorInput) -> AnomalyResponse:
-    try:
-        features = np.array(
-            [[
-                input_data.air_temperature,
-                input_data.process_temperature,
-                input_data.rotational_speed,
-                input_data.torque,
-            ]]
-        )
-
-        features_scaled = scaler.transform(features)
-
-        # IsolationForest: higher = more normal, so invert
-        raw_score = model.decision_function(features_scaled)[0]
-        anomaly_score = float(1.0 - (raw_score + 0.5))  # normalize-ish
-
-        is_anomaly = anomaly_score > 0.6
-
-        return AnomalyResponse(
-            anomaly_score=round(anomaly_score, 4),
-            is_anomaly=is_anomaly,
-        )
-
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
 
 @router.get(
     "/stats",
@@ -76,6 +58,33 @@ def dataset_stats() -> Dict[str, float]:
 
 
 
+@router.post(
+    "/predict",
+    response_model=AnomalyResponse,
+    summary="Predict anomaly score for a single sensor event",
+    description=(
+        "Receives one set of sensor measurements representing a produced item. "
+        "The data is preprocessed and passed to the anomaly detection model, "
+        "which returns an anomaly score and a boolean flag."
+    ),
+)
+def predict(input_data: SensorInput) -> AnomalyResponse:
+    try:
+        anomaly_score, is_anomaly = compute_anomaly_score(
+            air_temperature=input_data.air_temperature,
+            process_temperature=input_data.process_temperature,
+            rotational_speed=input_data.rotational_speed,
+            torque=input_data.torque,
+        )
+
+        return AnomalyResponse(
+            anomaly_score=anomaly_score,
+            is_anomaly=is_anomaly,
+        )
+
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
 @router.get(
     "/stream-simulate",
     summary="Simulate a real-time sensor data stream",
@@ -86,44 +95,40 @@ def dataset_stats() -> Dict[str, float]:
     ),
 )
 async def stream_simulate() -> StreamingResponse:
-
-    LIMIT = 100 
+    LIMIT = 100
     sample_data = df[FEATURE_COLUMNS].head(LIMIT)
-    
+
     async def generate():
-        for idx, row in sample_data.iterrows():
+        for _, row in sample_data.iterrows():
             sensor_data = {
                 "air_temperature": float(row["Air temperature [K]"]),
                 "process_temperature": float(row["Process temperature [K]"]),
                 "rotational_speed": float(row["Rotational speed [rpm]"]),
                 "torque": float(row["Torque [Nm]"]),
-                "timestamp": pd.Timestamp.now().isoformat()
+                "timestamp": pd.Timestamp.now().isoformat(),
             }
-            
-            features = features = np.array([[
-                row["Air temperature [K]"],
-                row["Process temperature [K]"],
-                row["Rotational speed [rpm]"],
-                row["Torque [Nm]"],
-            ]])
 
-            features_scaled = scaler.transform(features)
-            raw_score = model.decision_function(features_scaled)[0]
-            anomaly_score = float(1.0 - (raw_score + 0.5))
-            
+            anomaly_score, is_anomaly = compute_anomaly_score(
+                air_temperature=sensor_data["air_temperature"],
+                process_temperature=sensor_data["process_temperature"],
+                rotational_speed=sensor_data["rotational_speed"],
+                torque=sensor_data["torque"],
+            )
+
             yield f"data: {json.dumps({
                 'sensor_data': sensor_data,
-                'anomaly_score': round(anomaly_score, 4),
-                'is_anomaly': anomaly_score > 0.6
+                'anomaly_score': anomaly_score,
+                'is_anomaly': is_anomaly
             })}\n\n"
-            
+
             await asyncio.sleep(0.5)
-    
+
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive"
-        }
+            "Connection": "keep-alive",
+        },
     )
+
